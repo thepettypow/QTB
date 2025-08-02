@@ -1,0 +1,231 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: quiz_bot_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-telegram_quiz_bot}
+      POSTGRES_USER: ${DB_USER:-quiz_bot_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_123}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - quiz_bot_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-quiz_bot_user} -d ${DB_NAME:-telegram_quiz_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Celery and caching
+  redis:
+    image: redis:7-alpine
+    container_name: quiz_bot_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_password_123}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - quiz_bot_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Main Application
+  quiz_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quiz_bot_app
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://${DB_USER:-quiz_bot_user}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-telegram_quiz_bot}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_BOT_TOKEN=${ADMIN_BOT_TOKEN}
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5000
+      - FLASK_DEBUG=false
+      - MAIL_SERVER=${MAIL_SERVER}
+      - MAIL_PORT=${MAIL_PORT:-587}
+      - MAIL_USE_TLS=${MAIL_USE_TLS:-true}
+      - MAIL_USERNAME=${MAIL_USERNAME}
+      - MAIL_PASSWORD=${MAIL_PASSWORD}
+      - MAIL_DEFAULT_SENDER=${MAIL_DEFAULT_SENDER}
+      - ADMIN_EMAILS=${ADMIN_EMAILS}
+      - BACKUP_DIR=/app/backups
+      - UPLOAD_FOLDER=/app/uploads
+      - MAX_CONTENT_LENGTH=16777216
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-daily}
+      - MAX_BACKUPS=${MAX_BACKUPS:-30}
+      - COMPRESS_BACKUPS=${COMPRESS_BACKUPS:-true}
+    volumes:
+      - ./backups:/app/backups
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    ports:
+      - "${FLASK_PORT:-5000}:5000"
+    networks:
+      - quiz_bot_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Worker for background tasks
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quiz_bot_celery_worker
+    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://${DB_USER:-quiz_bot_user}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-telegram_quiz_bot}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - MAIL_SERVER=${MAIL_SERVER}
+      - MAIL_PORT=${MAIL_PORT:-587}
+      - MAIL_USE_TLS=${MAIL_USE_TLS:-true}
+      - MAIL_USERNAME=${MAIL_USERNAME}
+      - MAIL_PASSWORD=${MAIL_PASSWORD}
+      - MAIL_DEFAULT_SENDER=${MAIL_DEFAULT_SENDER}
+    volumes:
+      - ./backups:/app/backups
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    networks:
+      - quiz_bot_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Beat for scheduled tasks
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quiz_bot_celery_beat
+    command: celery -A celery_app beat --loglevel=info --scheduler=django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://${DB_USER:-quiz_bot_user}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-telegram_quiz_bot}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-redis_password_123}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - quiz_bot_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Nginx reverse proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: quiz_bot_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./static:/var/www/static:ro
+    networks:
+      - quiz_bot_network
+    depends_on:
+      - quiz_bot
+    restart: unless-stopped
+    profiles:
+      - with-nginx
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: quiz_bot_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - quiz_bot_network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: quiz_bot_grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - quiz_bot_network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  quiz_bot_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
